@@ -14,8 +14,8 @@
     # 確認のみ (実際の登録は行わない)
     python main.py container --month 202603 --dry-run
 
-    # ヘッドレスモード (ブラウザ非表示)
-    python main.py container --month 202603 --headless
+注意: ブラウザが開いたら手動で TAM にログインしてください。
+      ログイン完了後、自動的に処理が開始されます。
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ import sys
 
 from playwright.sync_api import sync_playwright
 
-from config import TAM_USER, TAM_PASSWORD, SPREADSHEET_ID
-from tam_login import login
+from config import SPREADSHEET_ID
+from tam_login import manual_login
 from sheets_reader import get_container_data, get_shipping_data, aggregate_shipping_by_product
 from container_registration import register_containers
 from shipping_registration import register_shipping
@@ -35,10 +35,6 @@ from shipping_registration import register_shipping
 def _validate_config() -> list[str]:
     """設定の妥当性を検証する。"""
     errors = []
-    if not TAM_USER:
-        errors.append("環境変数 TAM_USER が設定されていません。")
-    if not TAM_PASSWORD:
-        errors.append("環境変数 TAM_PASSWORD が設定されていません。")
     if not SPREADSHEET_ID:
         errors.append("環境変数 SPREADSHEET_ID が設定されていません。")
     return errors
@@ -131,12 +127,6 @@ def main() -> int:
         action="store_true",
         help="確認のみ (実際の登録は行わない)",
     )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="ヘッドレスモード (ブラウザ非表示)",
-    )
-
     args = parser.parse_args()
 
     # 設定検証
@@ -146,8 +136,6 @@ def main() -> int:
         for err in config_errors:
             print(f"  - {err}")
         print("\n必要な環境変数を設定してください:")
-        print("  export TAM_USER='your_user_id'")
-        print("  export TAM_PASSWORD='your_password'")
         print("  export SPREADSHEET_ID='your_spreadsheet_id'")
         return 1
 
@@ -157,7 +145,7 @@ def main() -> int:
     results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="ja-JP",
@@ -165,9 +153,9 @@ def main() -> int:
         page = context.new_page()
 
         try:
-            # TAM ログイン
-            print("[TAM Login] ログイン中...")
-            login(page)
+            # TAM 手動ログイン
+            print("[TAM Login] 手動ログインを開始します...")
+            manual_login(page)
 
             # 指定モードの実行
             if args.mode in ("container", "both"):

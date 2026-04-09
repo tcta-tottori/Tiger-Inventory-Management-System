@@ -1,107 +1,49 @@
-"""TAM Web システムへのログイン処理"""
+"""TAM Web システムへの手動ログイン待機処理"""
 
 from __future__ import annotations
 
-from playwright.sync_api import Page
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
-from config import TAM_BASE_URL, TAM_USER, TAM_PASSWORD
+from config import TAM_BASE_URL
 
 
-def login(page: Page, user: str = "", password: str = "") -> bool:
-    """TAM にログインする。
+def manual_login(page: Page, timeout: int = 300) -> bool:
+    """ブラウザで TAM を開き、ユーザーの手動ログインを待機する。
 
     Args:
         page: Playwright の Page オブジェクト。
-        user: TAM ユーザーID。省略時は環境変数 TAM_USER を使用。
-        password: TAM パスワード。省略時は環境変数 TAM_PASSWORD を使用。
+        timeout: ログイン待機のタイムアウト秒数 (デフォルト 300秒)。
 
     Returns:
-        ログイン成功なら True。
+        ログイン確認できたら True。
     """
-    user = user or TAM_USER
-    password = password or TAM_PASSWORD
-
-    if not user or not password:
-        raise ValueError(
-            "TAM_USER / TAM_PASSWORD が設定されていません。"
-            "環境変数または引数で指定してください。"
-        )
-
-    # TAM トップページにアクセス → ログインフォームが表示される想定
+    # TAM トップページにアクセス
     page.goto(TAM_BASE_URL, wait_until="networkidle")
 
-    # ログインフォームの検出と入力
-    # TAM のログインページ構造は実環境で確認が必要。
-    # 一般的な Java Struts アプリのフォーム要素を想定:
-    #   - ユーザーID: input[name="userId"] or input[name="j_username"]
-    #   - パスワード: input[name="password"] or input[name="j_password"]
-    #   - ログインボタン: input[type="submit"] or button
-
-    # 複数の候補セレクタを試行
-    user_selectors = [
-        'input[name="userId"]',
-        'input[name="j_username"]',
-        'input[name="username"]',
-        'input[name="loginId"]',
-        'input[type="text"]',
-    ]
-    pass_selectors = [
-        'input[name="password"]',
-        'input[name="j_password"]',
-        'input[name="passwd"]',
-        'input[type="password"]',
-    ]
-
-    user_input = None
-    for selector in user_selectors:
-        el = page.query_selector(selector)
-        if el:
-            user_input = el
-            break
-
-    pass_input = None
-    for selector in pass_selectors:
-        el = page.query_selector(selector)
-        if el:
-            pass_input = el
-            break
-
-    if not user_input or not pass_input:
-        # ログインフォームが見つからない場合、既にログイン済みの可能性
-        if _is_logged_in(page):
-            print("[TAM Login] 既にログイン済みです。")
-            return True
-        raise RuntimeError(
-            "TAM ログインフォームが見つかりません。"
-            "URL やページ構造を確認してください。"
-        )
-
-    user_input.fill(user)
-    pass_input.fill(password)
-
-    # ログインボタンをクリック
-    submit_selectors = [
-        'input[type="submit"]',
-        'button[type="submit"]',
-        'input[value="ログイン"]',
-        'button:has-text("ログイン")',
-    ]
-    for selector in submit_selectors:
-        btn = page.query_selector(selector)
-        if btn:
-            btn.click()
-            break
-    else:
-        # submit ボタンが見つからなければ Enter キーで送信
-        pass_input.press("Enter")
-
-    page.wait_for_load_state("networkidle")
-
+    # 既にログイン済みならスキップ
     if _is_logged_in(page):
-        print("[TAM Login] ログイン成功。")
+        print("[TAM Login] 既にログイン済みです。")
         return True
 
-    raise RuntimeError("TAM ログインに失敗しました。ユーザーID/パスワードを確認してください。")
+    print("[TAM Login] ブラウザが開きました。TAM にログインしてください。")
+    print(f"[TAM Login] ログイン完了まで待機中... (タイムアウト: {timeout}秒)")
+
+    try:
+        page.wait_for_selector(
+            'a:has-text("ログアウト")',
+            timeout=timeout * 1000,
+        )
+    except PlaywrightTimeout:
+        raise RuntimeError(
+            f"TAM ログインがタイムアウトしました ({timeout}秒)。"
+            "ブラウザでログインを完了してからやり直してください。"
+        )
+
+    if not _is_logged_in(page):
+        raise RuntimeError("TAM ログインの確認に失敗しました。")
+
+    print("[TAM Login] ログイン確認完了。自動化を開始します。")
+    return True
 
 
 def _is_logged_in(page: Page) -> bool:

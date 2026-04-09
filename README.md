@@ -130,8 +130,6 @@ playwright install chromium
 #    対象スプレッドシートをサービスアカウントに共有する
 
 # 5. 環境変数の設定
-export TAM_USER='your_tam_user_id'
-export TAM_PASSWORD='your_tam_password'
 export SPREADSHEET_ID='your_google_spreadsheet_id'
 ```
 
@@ -151,10 +149,9 @@ python main.py both --month 202604
 
 # 確認のみ (実際の登録は行わない)
 python main.py container --month 202603 --dry-run
-
-# ブラウザ非表示モード
-python main.py container --month 202603 --headless
 ```
+
+> **注意:** 実行するとブラウザが開きます。TAM のログイン画面が表示されたら手動でログインしてください。ログイン完了を検知すると自動処理が開始されます。
 
 ### データフロー
 
