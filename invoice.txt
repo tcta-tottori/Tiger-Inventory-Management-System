@@ -1,0 +1,618 @@
+// =============================================
+// INVOICE機能（タイガー関係に集約）
+// =============================================
+// 【元ファイル】INVOICE Ver.6 統合スクリプト
+// 【集約日】2026/03/17
+// 【残存機能】
+//   1. 出荷明細用インポート（読込 → 出荷明細用）
+//   2. 出荷予定明細出力（出荷明細用 → 同一SS内 出荷予定明細）
+//   3. アフター部品出力
+//   4. データクリア（出荷明細用）
+// 【廃止機能】確認願出力
+// 【変更点】出荷予定明細出力を外部SS→同一SS内に変更
+
+// =============================================
+// 設定取得（INVOICE用）
+// =============================================
+
+/**
+ * 設定シートから値を取得する（INVOICE機能用）
+ * @param {string} settingName - 検索する項目名（A列の値）
+ * @return {string} 設定値（B列の値）。見つからない場合は空文字
+ */
+function getInvoiceSettingValue_(settingName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const settingSheet = ss.getSheetByName('設定');
+  if (!settingSheet) return '';
+  const data = settingSheet.getDataRange().getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] && data[i][0].toString().trim() === settingName) {
+      return data[i][1] ? data[i][1].toString().trim() : '';
+    }
+  }
+  return '';
+}
+
+// =============================================
+// 出荷明細用インポート（読込シート → 出荷明細用シート）
+// =============================================
+
+/**
+ * 同一SS内「読込」シートからデータを読み取り → 出荷明細用シートへ書き込み
+ */
+function importFromYomikomiSheet() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  try {
+    ss.toast('読込シートからデータを取得中...', '出荷明細用インポート', -1);
+
+    const detailData = getDataFromYomikomiSheet_();
+
+    if (!detailData || detailData.length === 0) {
+      ui.alert('エラー', '「読込」シートにインポート可能なデータがありません。', ui.ButtonSet.OK);
+      return;
+    }
+
+    ss.toast('出荷明細用シートに書き込み中...', '出荷明細用インポート', -1);
+    const result = writeToShukkaYoSheet_(detailData);
+
+    ui.alert('処理完了', '出荷明細用シートに ' + result.count + ' 件のデータをインポートしました。', ui.ButtonSet.OK);
+    ss.toast('処理が完了しました。', '出荷明細用インポート', 5);
+
+  } catch (e) {
+    Logger.log(e.stack);
+    ui.alert('エラー', '処理中にエラーが発生しました:\n' + e.message, ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * 同一SS内「読込」シートからデータを取得
+ * ヘッダー行（A列="No."）を動的に探し、その次の行からデータを読み取る
+ * @return {Object[]} detailData - 詳細データ配列
+ */
+function getDataFromYomikomiSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSheet = ss.getSheetByName('読込');
+  if (!sourceSheet) {
+    throw new Error('「読込」シートが見つかりません。');
+  }
+
+  const allData = sourceSheet.getDataRange().getValues();
+
+  // ヘッダー行("No.")を動的に探す
+  let startRowIndex = -1;
+  for (let i = 0; i < allData.length; i++) {
+    if (allData[i][0] && String(allData[i][0]).trim() === 'No.') {
+      startRowIndex = i + 1;
+      break;
+    }
+  }
+
+  if (startRowIndex < 0) {
+    throw new Error('「読込」シートにヘッダー行（A列="No."）が見つかりません。');
+  }
+
+  const detailData = [];
+  for (let j = startRowIndex; j < allData.length; j++) {
+    const detailRow = allData[j];
+
+    // 終了判定：A列もB列も空の場合（5行先まで確認）
+    if (!detailRow[0] && !detailRow[1]) {
+      let hasDataLater = false;
+      for (let k = 1; k <= 5 && (j + k) < allData.length; k++) {
+        if (allData[j + k][0] || allData[j + k][1]) {
+          hasDataLater = true;
+          break;
+        }
+      }
+      if (!hasDataLater) break;
+      continue;
+    }
+
+    // ヘッダー行が再登場した場合スキップ
+    if (detailRow[0] && String(detailRow[0]).trim() === 'No.') continue;
+
+    // B列(REF No.)がある行のみ対象
+    if (detailRow[1]) {
+      detailData.push({
+        no: detailRow[0],
+        refNo: detailRow[1],
+        invoiceNo: detailRow[2],
+        date: detailRow[3],
+        partsNo: detailRow[4],
+        description: detailRow[5],
+        item: detailRow[6],
+        quantity: detailRow[7],
+        cartons: detailRow[8],
+        nw: detailRow[9],
+        unitPrice: detailRow[10],
+        amount: detailRow[11],
+        vessel: detailRow[12],
+        containerNo: detailRow[13],
+        size: detailRow[14],
+        customsPlace: detailRow[15],
+        etd: detailRow[16],
+        arrivalDate: detailRow[17],
+        hyokaUp: detailRow[18],
+        kakuninGaku: detailRow[19],
+        after: detailRow[20]
+      });
+    }
+  }
+
+  return detailData;
+}
+
+// =============================================
+// 出荷明細用シートへの書き込み
+// =============================================
+
+/**
+ * 出荷明細用シートにデータを書き込む
+ * @param {Object[]} detailData - 詳細データ配列
+ * @return {Object} 書き込み結果 { count: 件数 }
+ */
+function writeToShukkaYoSheet_(detailData) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shukkaSheet = ss.getSheetByName('出荷明細用');
+  if (!shukkaSheet) throw new Error('「出荷明細用」シートが見つかりません。');
+
+  const lastRow = shukkaSheet.getLastRow();
+  if (lastRow >= 2) shukkaSheet.getRange(2, 1, lastRow - 1, shukkaSheet.getLastColumn()).clearContent();
+  if (detailData.length === 0) return { count: 0 };
+
+  const dataToWrite = [];
+  const timeZone = ss.getSpreadsheetTimeZone();
+
+  for (let i = 0; i < detailData.length; i++) {
+    const row = detailData[i];
+    const vesselInfo = parseVesselInfo_(row.vessel);
+    dataToWrite.push([
+      row.no || (i + 1),                                    // A: No
+      row.refNo || '',                                       // B: DELIVERY RECEIPT NO
+      formatDateValueForImport_(row.date, timeZone),         // C: DATE
+      row.partsNo || '',                                     // D: PARTS NO
+      combineDescriptionItem_(row.description, row.item),    // E: DESCRIPTION+ITEM
+      row.quantity || '',                                    // F: QUANTITY
+      row.cartons || '',                                     // G: CARTONS
+      row.nw || '',                                          // H: N.W.
+      vesselInfo.shipName || '',                             // I: SHIPPED (前) - 船名
+      vesselInfo.voyageNo || '',                             // J: SHIPPED (後) - 航海番号
+      formatDateValueForImport_(row.etd, timeZone),          // K: ETD
+      formatDateValueForImport_(row.arrivalDate, timeZone),  // L: ETA
+      row.customsPlace || '',                                // M: FROM ETA
+      '',                                                    // N: FROM ETD
+      row.size || '',                                        // O: REMARK4 (SIZE)
+      false                                                  // P: チェックボックス
+    ]);
+  }
+
+  if (dataToWrite.length > 0) {
+    shukkaSheet.getRange(2, 1, dataToWrite.length, dataToWrite[0].length).setValues(dataToWrite);
+    shukkaSheet.getRange(2, 3, dataToWrite.length, 1).setNumberFormat('yyyy/mm/dd');
+    shukkaSheet.getRange(2, 11, dataToWrite.length, 1).setNumberFormat('yyyy/mm/dd');
+    shukkaSheet.getRange(2, 12, dataToWrite.length, 1).setNumberFormat('yyyy/mm/dd');
+  }
+
+  return { count: dataToWrite.length };
+}
+
+// =============================================
+// 出荷予定明細出力（出荷明細用 → 同一SS内 出荷予定明細）
+// =============================================
+
+/**
+ * 出荷予定明細出力（メニュー用）
+ */
+function exportShukkaYoToShippingScheduleMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  try {
+    ss.toast('出荷予定明細に出力中...', '出荷予定明細出力', -1);
+
+    const exportResult = exportShukkaYoToShippingSchedule_();
+
+    // 完了メッセージ（同一SS内なのでリンクは不要）
+    let htmlContent = '<div style="font-family: sans-serif; padding: 10px; line-height: 1.6;">';
+    htmlContent += '<h3 style="color: #107c41;">【出力完了】</h3>';
+    htmlContent += '<p><strong>■ 出荷予定明細:</strong> ' + exportResult.count + '件 出力</p>';
+    htmlContent += '<div style="background-color: #f1f3f4; padding: 8px; border-radius: 4px; font-size: 0.9em; margin-top: 10px;">';
+    htmlContent += '<strong>処理されたREF No.:</strong><br>' + (exportResult.refNo || 'なし');
+    htmlContent += '</div>';
+    htmlContent += '<br><div style="text-align: right;"><input type="button" value="閉じる" onclick="google.script.host.close()" style="padding: 6px 12px;" /></div>';
+    htmlContent += '</div>';
+
+    const htmlOutput = HtmlService.createHtmlOutput(htmlContent).setWidth(400).setHeight(250);
+    ui.showModalDialog(htmlOutput, '出力完了レポート');
+
+    ss.toast('処理が完了しました。', '出荷予定明細出力', 5);
+
+  } catch (e) {
+    Logger.log(e.stack);
+    ui.alert('エラー', '処理中にエラーが発生しました:\n' + e.message, ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * 出荷明細用シート → 出荷予定明細（同一SS内）への出力
+ * REF No.ごとに昇順で並び替え、既存のREF No.の位置に挿入
+ * ない場合は「直前の番号（自分より小さい最大値）」の後ろへ挿入
+ * @return {Object} - {count: 件数, refNo: REF No.一覧}
+ */
+function exportShukkaYoToShippingSchedule_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 出荷明細用シートからデータ取得
+  const shukkaYoSheet = ss.getSheetByName('出荷明細用');
+  if (!shukkaYoSheet) {
+    throw new Error('「出荷明細用」シートが見つかりません。');
+  }
+
+  const lastRowSource = shukkaYoSheet.getLastRow();
+  if (lastRowSource < 2) {
+    throw new Error('「出荷明細用」シートにデータがありません。');
+  }
+
+  const numSourceRows = lastRowSource - 1;
+  const sourceValues = shukkaYoSheet.getRange(2, 1, numSourceRows, 16).getValues();
+
+  // REF No.ごとにデータをグループ化
+  const refNoGroups = {};
+  const refNoList = [];
+
+  for (let i = 0; i < sourceValues.length; i++) {
+    const row = sourceValues[i];
+    const refNo = String(row[1]).trim(); // B列: REF No.
+
+    if (!refNo) continue;
+
+    if (!refNoGroups[refNo]) {
+      refNoGroups[refNo] = [];
+      refNoList.push(refNo);
+    }
+
+    // 出荷予定明細用のデータに変換（19列）
+    const newRow = Array(19).fill('');
+    newRow[3] = row[0];   // D列 ← No (A列)
+    newRow[4] = row[1];   // E列 ← REF No. (B列)
+    newRow[5] = row[2];   // F列 ← DATE (C列)
+    newRow[6] = row[3];   // G列 ← PARTS NO (D列)
+    // H列は出力しない
+    newRow[8] = row[5];   // I列 ← QUANTITY (F列)
+    newRow[12] = row[8];  // M列 ← SHIPPED前 (I列)
+    newRow[13] = row[9];  // N列 ← SHIPPED後 (J列)
+    newRow[14] = row[10]; // O列 ← ETD (K列)
+    newRow[15] = row[11]; // P列 ← ETA (L列)
+    newRow[16] = row[12]; // Q列 ← FROM ETA (M列) = 仕向地
+    newRow[17] = row[13]; // R列 ← FROM ETD (N列)
+    newRow[18] = row[14]; // S列 ← SIZE (O列)
+
+    refNoGroups[refNo].push(newRow);
+  }
+
+  // REF No.を昇順でソート
+  refNoList.sort();
+
+  // 同一SS内の出荷予定明細シートを取得
+  const destinationSheet = ss.getSheetByName(CONFIG.sourceSheetName);
+  if (!destinationSheet) {
+    throw new Error('「出荷予定明細」シートが見つかりません。');
+  }
+
+  // フィルターがかかっている場合は解除する（行挿入・削除の不具合防止）
+  const existingFilter = destinationSheet.getFilter();
+  if (existingFilter) {
+    existingFilter.remove();
+  }
+
+  // 既存ハイライトをクリア
+  let lastRowDest = destinationSheet.getLastRow();
+  if (lastRowDest > 1) {
+    destinationSheet.getDataRange().offset(1, 0).setBackground(null);
+  }
+
+  // REF No.を逆順で処理（後ろから処理することで、行挿入による位置ズレを防ぐ）
+  let totalCount = 0;
+  const processedRefNos = [];
+
+  for (let r = refNoList.length - 1; r >= 0; r--) {
+    const currentRefNo = refNoList[r];
+    const dataToInsert = refNoGroups[currentRefNo];
+
+    if (!dataToInsert || dataToInsert.length === 0) continue;
+
+    // 現在の出荷予定明細シートのデータを再取得
+    lastRowDest = destinationSheet.getLastRow();
+
+    // 該当REF No.の既存行を検索（E列=5列目）
+    const existingRows = [];
+    if (lastRowDest > 1) {
+      const eColumnValues = destinationSheet.getRange(2, 5, lastRowDest - 1, 1).getValues();
+      for (let e = 0; e < eColumnValues.length; e++) {
+        if (String(eColumnValues[e][0]).trim() === currentRefNo) {
+          existingRows.push(e + 2);
+        }
+      }
+    }
+
+    // 既存データのJ列(備考=10列目)を保持
+    const jColumnDataMap = new Map();
+    if (existingRows.length > 0) {
+      existingRows.forEach(function(rowNum) {
+        const gValue = destinationSheet.getRange(rowNum, 7).getValue();
+        const jValue = destinationSheet.getRange(rowNum, 10).getValue();
+        if (gValue && jValue) jColumnDataMap.set(String(gValue), jValue);
+      });
+    }
+
+    // 保持していたJ列(備考)を復元
+    dataToInsert.forEach(function(row) {
+      const gValue = String(row[6]);
+      if (jColumnDataMap.has(gValue)) {
+        row[9] = jColumnDataMap.get(gValue);
+      }
+    });
+
+    let writeStartRow;
+
+    if (existingRows.length > 0) {
+      // 既存行がある場合：既存行を削除して同じ位置に挿入
+      writeStartRow = existingRows[0];
+
+      for (let d = existingRows.length - 1; d >= 0; d--) {
+        destinationSheet.deleteRow(existingRows[d]);
+      }
+
+      if (dataToInsert.length > 0) {
+        const insertAfterRow = writeStartRow - 1;
+        if (insertAfterRow >= 1) {
+          destinationSheet.insertRowsAfter(insertAfterRow, dataToInsert.length);
+        }
+      }
+    } else {
+      // 既存行がない場合：直前の番号を探して、その【後ろ】に挿入
+      writeStartRow = findInsertPositionForInvoice_(destinationSheet, currentRefNo);
+
+      if (dataToInsert.length > 0) {
+        const insertAfterRow = writeStartRow - 1;
+
+        if (insertAfterRow >= 1) {
+          destinationSheet.insertRowsAfter(insertAfterRow, dataToInsert.length);
+        } else {
+          destinationSheet.insertRowsAfter(1, dataToInsert.length);
+          writeStartRow = 2;
+        }
+      }
+    }
+
+    // データを書き込み
+    if (dataToInsert.length > 0) {
+      const writeRange = destinationSheet.getRange(writeStartRow, 1, dataToInsert.length, dataToInsert[0].length);
+      writeRange.setValues(dataToInsert);
+      writeRange.setBackground('#d9d2e9'); // ハイライト（紫色）
+    }
+
+    totalCount += dataToInsert.length;
+    processedRefNos.push(currentRefNo);
+  }
+
+  processedRefNos.reverse();
+  return { count: totalCount, refNo: processedRefNos.join(', ') };
+}
+
+/**
+ * 挿入位置を決定する関数（INVOICE用）
+ * 「自分より小さい値の中で最大のもの（直前の番号）」を探し、その最後尾の後ろを返す
+ * @param {Sheet} sheet - 対象シート
+ * @param {string} refNo - 挿入するREF No.
+ * @return {number} 挿入開始行番号
+ */
+function findInsertPositionForInvoice_(sheet, refNo) {
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) return 2;
+
+  const values = sheet.getRange(2, 5, lastRow - 1, 1).getValues();
+  const flatValues = values.map(function(row) { return row[0] ? String(row[0]).trim() : ''; });
+
+  // 自分より「小さい」値の中で、最大のものを探す
+  let predecessor = null;
+  for (let i = 0; i < flatValues.length; i++) {
+    const val = flatValues[i];
+    if (!val) continue;
+    if (val < refNo) {
+      if (predecessor === null || val > predecessor) {
+        predecessor = val;
+      }
+    }
+  }
+
+  if (predecessor === null) return 2;
+
+  // 直前の番号が存在する最後の行を探す
+  let insertAfterIndex = -1;
+  for (let i = 0; i < flatValues.length; i++) {
+    if (flatValues[i] === predecessor) {
+      insertAfterIndex = i;
+    }
+  }
+
+  return insertAfterIndex + 3;
+}
+
+// =============================================
+// アフター部品出力
+// =============================================
+
+/**
+ * アフター部品出力
+ * 出荷明細用シートのチェック行から注残リストを参照してアフター部品リストを作成・ダウンロード
+ */
+function exportAfterPartsList() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let tempSheet = null;
+
+  try {
+    const sourceSheet = ss.getSheetByName('出荷明細用');
+    if (!sourceSheet) throw new Error('シート「出荷明細用」が見つかりません。');
+    const destinationSheet = ss.getSheetByName('アフター部品リスト');
+    if (!destinationSheet) throw new Error('シート「アフター部品リスト」が見つかりません。');
+
+    ss.toast('処理を開始します...', 'アフター部品出力', -1);
+    if (destinationSheet.getLastRow() > 1) {
+      destinationSheet.getRange(2, 1, destinationSheet.getLastRow() - 1, destinationSheet.getLastColumn()).clear();
+    }
+
+    const sourceValues = sourceSheet.getDataRange().getValues();
+    const checkedRows = [];
+    sourceValues.forEach(function(row, index) {
+      if (index > 0 && row[15] === true) checkedRows.push({ data: row, rowNum: index + 1 });
+    });
+
+    if (checkedRows.length === 0) { ui.alert('処理対象の行（P列でチェックされている行）がありません。'); return; }
+
+    // 注残リストは同一SS内
+    const backlogSheet = ss.getSheetByName('注残リスト');
+    if (!backlogSheet) throw new Error('「注残リスト」シートが見つかりません。');
+
+    const backlogValues = backlogSheet.getDataRange().getValues();
+    const backlogMap = new Map();
+    for (let i = 1; i < backlogValues.length; i++) {
+      const row = backlogValues[i];
+      if (row[0]) backlogMap.set(row[0].toString().trim(), { col_D: row[3], col_E: row[4], col_K: row[10] });
+    }
+
+    const dataToWrite = [];
+    checkedRows.forEach(function(checkedRow) {
+      const sourceRowData = checkedRow.data;
+      const backlogData = backlogMap.get(sourceRowData[3].toString().trim());
+      dataToWrite.push([
+        sourceRowData[3], backlogData ? backlogData.col_D : '', backlogData ? backlogData.col_E : '',
+        backlogData ? backlogData.col_K : '', sourceRowData[5], sourceRowData[6]
+      ]);
+    });
+
+    if (dataToWrite.length > 0) {
+      const startRow = destinationSheet.getLastRow() + 1;
+      destinationSheet.getRange(startRow, 1, dataToWrite.length, 6).setValues(dataToWrite);
+      for (let j = 0; j < dataToWrite.length; j++) {
+        const currentRow = startRow + j;
+        const eValue = destinationSheet.getRange(currentRow, 5).getValue();
+        const fValue = destinationSheet.getRange(currentRow, 6).getValue();
+        if (typeof eValue === 'number' && typeof fValue === 'number' && fValue !== 0) {
+          destinationSheet.getRange(currentRow, 7).setValue(eValue / fValue).setNumberFormat('0.0');
+        }
+      }
+      destinationSheet.getRange(startRow, 1, dataToWrite.length, 7)
+        .setBorder(true, true, true, true, true, true, '#000000', SpreadsheetApp.BorderStyle.SOLID);
+    }
+
+    checkedRows.forEach(function(checkedRow) { sourceSheet.getRange(checkedRow.rowNum, 16).setValue(false); });
+
+    ss.toast('ダウンロードの準備をしています...', 'アフター部品出力', -1);
+    const baseFileName = sourceSheet.getRange('B2').getValue().toString();
+    const finalFileName = baseFileName + 'アフター部品リスト';
+
+    tempSheet = destinationSheet.copyTo(ss);
+    tempSheet.setName(baseFileName || 'Sheet1');
+    SpreadsheetApp.flush();
+
+    const exportUrl = ss.getUrl().replace(/\/edit.*$/, '') + '/export?format=xlsx&gid=' + tempSheet.getSheetId();
+    const response = UrlFetchApp.fetch(exportUrl, { headers: { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+
+    if (response.getResponseCode() !== 200) throw new Error('ファイルのエクスポートに失敗しました。');
+
+    const blob = response.getBlob().setName(finalFileName + '.xlsx');
+    const dataUrl = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,' + Utilities.base64Encode(blob.getBytes());
+
+    const htmlOutput = HtmlService.createHtmlOutput(
+      '<p>ファイルの準備ができました。</p>' +
+      '<a href="' + dataUrl + '" download="' + finalFileName + '.xlsx" ' +
+      'style="font-size: 16px; font-weight: bold; text-decoration: none; background-color: #107c41; color: white; padding: 10px 15px; border-radius: 5px; display: inline-block;">' +
+      '『' + finalFileName + '.xlsx』をダウンロード</a>' +
+      '<br><br><input type="button" value="閉じる" onclick="google.script.host.close()" />'
+    ).setWidth(450).setHeight(200);
+
+    ui.showModalDialog(htmlOutput, 'ダウンロード準備完了');
+    ss.toast('処理が完了しました。', 'アフター部品出力', 5);
+
+  } catch (e) {
+    Logger.log(e.stack);
+    ui.alert('処理中にエラーが発生しました: ' + e.message);
+  } finally {
+    if (tempSheet) ss.deleteSheet(tempSheet);
+  }
+}
+
+// =============================================
+// データクリア関数
+// =============================================
+
+/**
+ * 出荷明細用シートのデータをクリアする
+ */
+function clearShukkaSheet() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert('確認', '出荷明細用シートの2行目以降のデータをクリアしますか？', ui.ButtonSet.YES_NO);
+  if (response !== ui.Button.YES) return;
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('出荷明細用');
+  if (!sheet) { ui.alert('エラー', '「出荷明細用」シートが見つかりません。', ui.ButtonSet.OK); return; }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 2) sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  ui.alert('完了', '出荷明細用シートのデータをクリアしました。', ui.ButtonSet.OK);
+}
+
+// =============================================
+// INVOICE用ユーティリティ関数
+// =============================================
+
+/**
+ * 日付値をインポート用にフォーマットする
+ * @param {*} dateValue - 日付値
+ * @param {string} timeZone - タイムゾーン
+ * @return {*} フォーマット済み日付値
+ */
+function formatDateValueForImport_(dateValue, timeZone) {
+  if (!dateValue) return '';
+  if (dateValue instanceof Date) return dateValue;
+  const dateStr = dateValue.toString();
+  if (dateStr.match(/^\d{4}-\d{2}-\d{2}/)) return new Date(dateStr);
+  return dateValue;
+}
+
+/**
+ * 船舶情報を解析する
+ * @param {*} vessel - 船舶文字列
+ * @return {Object} { shipName, voyageNo }
+ */
+function parseVesselInfo_(vessel) {
+  if (!vessel) return { shipName: '', voyageNo: '' };
+  const vesselStr = vessel.toString();
+  const match = vesselStr.match(/^(.+?)\s+V\.(.+)$/);
+  if (match) return { shipName: match[1].trim(), voyageNo: match[2].trim() };
+  const parts = vesselStr.split(/\s+/);
+  if (parts.length > 1) {
+    const lastPart = parts[parts.length - 1];
+    if (lastPart.match(/^[NS]\d+$/) || lastPart.match(/^[A-Z]?\d+$/)) {
+      return { shipName: parts.slice(0, -1).join(' '), voyageNo: lastPart };
+    }
+  }
+  return { shipName: vesselStr, voyageNo: '' };
+}
+
+/**
+ * DESCRIPTION と ITEM を結合する
+ * @param {*} description - 説明
+ * @param {*} item - アイテム
+ * @return {string} 結合文字列
+ */
+function combineDescriptionItem_(description, item) {
+  const desc = description ? description.toString().trim() : '';
+  const itm = item ? item.toString().trim() : '';
+  return (desc && itm) ? desc + ' ' + itm : (desc || itm || '');
+}

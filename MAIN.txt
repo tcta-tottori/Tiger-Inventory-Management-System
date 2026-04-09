@@ -1,0 +1,699 @@
+// =====================================================================
+// == グローバル設定エリア
+// =====================================================================
+
+const CONFIG = {
+  // --- シート名 ---
+  entrySheetName: "入荷予定書込",
+  targetSheetName: "入荷予定",
+  sourceSheetName: "出荷予定明細",
+  codeSheetName: "コード",
+  confirmSheetName: "確定分",
+  containerSheetName: "コンテナ登録",
+  tokyoSheetName: "東京向け",
+  osakaSheetName: "大阪向け",
+  
+  // --- 入力セル ---
+  shippingNoCell: "B2",
+  periodCell: "B4",
+  containerDropdownCell: "B2",
+
+  // --- 出力設定 ---
+  startRow: 7,
+  rowGap: 2,
+  containerPasteStartCell: "A5",
+};
+
+const SOURCE_COLS = {
+  E: 4, F_DATE: 5, I_QTY: 8, G_CODE: 6, J_PERIOD: 9, O_DATE1: 14, P_DATE2: 15, Q_PORT: 16, S_ETC: 18,
+};
+
+const TARGET_COLS = {
+  A_SHIP_NO: 1, B_C_VAL: 2, C_F_VAL: 3, D_CODE: 4, E_DATE: 5, F_QTY: 6, G_DATE1: 7, H_DATE2: 8, I_QTY_COND: 9, J_PERIOD: 10, K_PORT: 11, L_ETC: 12, M_E_VAL: 13,
+};
+
+
+// =====================================================================
+// == メニュー作成機能
+// =====================================================================
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  ui.createMenu('▼メニュー')
+    .addItem('プルダウン更新', 'createContainerDropdown')
+    .addSeparator()
+    .addItem('REF No.更新', 'updateRefNo')
+    .addSeparator()
+    .addItem('アフター部品更新', 'updateAfterParts')
+    .addSeparator()
+    .addItem('数量自動調整', 'adjustQuantities')
+    .addToUi();
+
+  ui.createMenu('▼INVOICE')
+    .addItem('▼出荷明細用インポート', 'importFromYomikomiSheet')
+    .addItem('▼出荷予定明細出力', 'exportShukkaYoToShippingScheduleMenu')
+    .addSeparator()
+    .addItem('▽アフター部品出力', 'exportAfterPartsList')
+    .addSeparator()
+    .addItem('▽データクリア（出荷明細用）', 'clearShukkaSheet')
+    .addToUi();
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const containerSheet = ss.getSheetByName(CONFIG.containerSheetName);
+    if (containerSheet && containerSheet.getLastRow() >= 5) {
+      const lastCol = containerSheet.getLastColumn() || 10;
+      containerSheet.getRange(5, 1, containerSheet.getLastRow() - 4, lastCol).setBackground(null);
+      containerSheet.getRange(5, 1, containerSheet.getLastRow() - 4, lastCol).setFontWeight("normal");
+    }
+  } catch (err) {}
+}
+
+
+// =====================================================================
+// == REF No.更新機能（コンテナ登録シート基準ソート版）
+// =====================================================================
+
+function updateRefNo() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    const sourceSheet = ss.getSheetByName(CONFIG.sourceSheetName);
+    if (!sourceSheet) {
+      throw new Error(`データ取得元の「${CONFIG.sourceSheetName}」シートが見つかりません。`);
+    }
+    const lastRowSrc = sourceSheet.getLastRow();
+    if (lastRowSrc < 2) return;
+    
+    const sourceData = sourceSheet.getRange(2, 1, lastRowSrc - 1, sourceSheet.getLastColumn()).getValues();
+
+    const allSheets = ss.getSheets();
+    const targetSheets = allSheets.filter(sheet => sheet.getName().includes("月度"));
+
+    if (targetSheets.length === 0) {
+      ui.alert("名前に「月度」が含まれるシートが見つかりませんでした。");
+      return;
+    }
+
+    // コンテナ登録シートからREF No.→日付情報のマップを作成
+    const containerSheet = ss.getSheetByName(CONFIG.containerSheetName);
+    const containerMap = new Map();
+    if (containerSheet && containerSheet.getLastRow() >= 5) {
+      const cData = containerSheet.getRange(5, 1, containerSheet.getLastRow() - 4, 5).getValues();
+      for (const row of cData) {
+        const ref = (row[0] || "").toString();
+        if (ref) {
+          containerMap.set(ref, {
+            factoryDate: row[2],  // C列=工場出荷日
+            etd: row[3],          // D列=ETD
+            eta: row[4],          // E列=ETA
+          });
+        }
+      }
+    }
+
+    const toTime = (v) => {
+      if (v instanceof Date) return v.getTime();
+      if (v) return new Date(v).getTime();
+      return Infinity;
+    };
+    
+    let updatedSheetNames = [];
+
+    for (const sheet of targetSheets) {
+      const sheetName = sheet.getName();
+      const searchKey = sheet.getRange("A1").getValue();
+
+      if (!searchKey) {
+        console.log(`シート「${sheetName}」はA1セルが空のためスキップしました。`);
+        continue;
+      }
+
+      // データの絞り込み（ユニークなREF No.を取得）
+      const matchedRows = sourceData.filter(row => row[9] === searchKey);
+      const uniqueRefs = [...new Set(matchedRows.map(row => row[4]).filter(v => v))];
+
+      if (uniqueRefs.length === 0) {
+        console.log(`シート「${sheetName}」のキー「${searchKey}」に一致するデータは見つかりませんでした。`);
+        sheet.getRange("I1:1").clearContent();
+        continue;
+      }
+
+      // コンテナ登録シートの日付情報でソート（第1:工場出荷日, 第2:ETD, 第3:ETA）
+      const targetData = uniqueRefs.map(ref => {
+        const containerInfo = containerMap.get(ref.toString());
+        if (containerInfo) {
+          return {
+            eValue: ref,
+            factoryDate: toTime(containerInfo.factoryDate),
+            etd: toTime(containerInfo.etd),
+            eta: toTime(containerInfo.eta),
+          };
+        }
+        // コンテナ登録に未登録の場合は出荷予定明細からフォールバック
+        const srcRow = matchedRows.find(r => r[4] === ref);
+        return {
+          eValue: ref,
+          factoryDate: srcRow ? toTime(srcRow[5]) : Infinity,
+          etd: srcRow ? toTime(srcRow[SOURCE_COLS.O_DATE1]) : Infinity,
+          eta: srcRow ? toTime(srcRow[SOURCE_COLS.P_DATE2]) : Infinity,
+        };
+      });
+
+      // 並べ替え（第1: 工場出荷日, 第2: ETD, 第3: ETA）
+      targetData.sort((a, b) => {
+        if (a.factoryDate !== b.factoryDate) return a.factoryDate - b.factoryDate;
+        if (a.etd !== b.etd) return a.etd - b.etd;
+        return a.eta - b.eta;
+      });
+
+      // ソート済みのREF No.をそのまま使用
+      const uniqueEValues = targetData.map(item => item.eValue);
+      
+      sheet.getRange("I1:ZZ1").clearContent();
+      if (uniqueEValues.length > 0) {
+        sheet.getRange(1, 9, 1, uniqueEValues.length).setValues([uniqueEValues]);
+      }
+      
+      updatedSheetNames.push(sheetName);
+    }
+
+    if (updatedSheetNames.length > 0) {
+      ui.alert(`以下のシートのREF No.を更新しました:\n\n- ${updatedSheetNames.join('\n- ')}`);
+    } else {
+      ui.alert("更新対象となるデータを持つ「月度」シートはありませんでした。");
+    }
+
+  } catch (e) {
+    ui.alert(`エラーが発生しました: ${e.message}`);
+  }
+}
+
+// =====================================================================
+// == コンテナ登録シートの機能
+// =====================================================================
+
+function createContainerDropdown() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sourceSheet = ss.getSheetByName(CONFIG.sourceSheetName);
+    const targetSheet = ss.getSheetByName(CONFIG.containerSheetName);
+    if (!sourceSheet || !targetSheet) throw new Error("必要なシートが見つかりません。");
+    const lastRow = sourceSheet.getLastRow();
+    if (lastRow < 2) return;
+    const jColumnValues = sourceSheet.getRange(2, 10, lastRow - 1, 1).getValues();
+    const filteredList = jColumnValues.flat().filter(v => typeof v === 'string' && v.includes("月期"));
+    const uniqueList = [...new Set(filteredList)];
+    if (uniqueList.length > 0) {
+      const dropdownCell = targetSheet.getRange(CONFIG.containerDropdownCell);
+      const rule = SpreadsheetApp.newDataValidation().requireValueInList(uniqueList).setAllowInvalid(false).build();
+      dropdownCell.setDataValidation(rule);
+      ui.alert('コンテナ登録シートのプルダウンを更新しました。');
+    }
+  } catch(e) { ui.alert(`エラー: ${e.message}`); }
+}
+
+function handleContainerEdit(e) {
+    const targetSheet = e.range.getSheet();
+    const dropdownValue = e.value;
+    const pasteStartRange = targetSheet.getRange(CONFIG.containerPasteStartCell);
+    const pasteStartRow = pasteStartRange.getRow();
+    const lastRow = targetSheet.getLastRow();
+    if (lastRow >= pasteStartRow) {
+        targetSheet.getRange(pasteStartRow, 1, lastRow - pasteStartRow + 1, 1).clearContent();
+    }
+    if (!dropdownValue) return;
+    const sourceSheet = e.source.getSheetByName(CONFIG.sourceSheetName);
+    if (!sourceSheet) return;
+    const sourceData = sourceSheet.getDataRange().getValues();
+    let uniqueValues = new Set();
+    for (let i = 1; i < sourceData.length; i++) {
+        if (sourceData[i][9] == dropdownValue) {
+            const valueFromE = sourceData[i][4];
+            if (valueFromE !== "" && !uniqueValues.has(valueFromE)) {
+                uniqueValues.add(valueFromE);
+            }
+        }
+    }
+    const valuesToPaste = Array.from(uniqueValues).map(value => [value]);
+    if (valuesToPaste.length > 0) {
+        targetSheet.getRange(pasteStartRow, 1, valuesToPaste.length, 1).setValues(valuesToPaste);
+    }
+}
+
+
+// =====================================================================
+// == 入荷予定シートの機能
+// =====================================================================
+
+function createArrivalSchedule() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    ss.toast("処理を開始します...", "情報", 5);
+    
+    const entrySheet = ss.getSheetByName(CONFIG.entrySheetName);
+    if (!entrySheet) throw new Error(`シート「${CONFIG.entrySheetName}」が見つかりません。`);
+    
+    entrySheet.getRange("B6:B7").clearContent();
+
+    const shippingNoString = entrySheet.getRange(CONFIG.shippingNoCell).getValue();
+    const period = entrySheet.getRange(CONFIG.periodCell).getValue().toString();
+    if (!shippingNoString || !period) throw new Error("「出荷番号」と「月期」を入力してください。");
+    let currentShippingNo = Number(shippingNoString);
+    if (isNaN(currentShippingNo)) throw new Error("出荷番号は数値で入力してください。");
+
+    const sourceSheet = ss.getSheetByName(CONFIG.sourceSheetName);
+    const codeSheet = ss.getSheetByName(CONFIG.codeSheetName);
+    const sourceData = sourceSheet.getRange(2, 1, sourceSheet.getLastRow() - 1, sourceSheet.getLastColumn()).getValues();
+    const codeMap = new Map(codeSheet.getRange(2, 1, codeSheet.getLastRow() - 1, 8).getValues().map(row => [row[1], { c_val: row[2], f_val: row[5], g_val: row[6], h_val: row[7] }]));
+
+    // --- インストンシートからREF No.→コンテナNo.のマップを構築 ---
+    const containerNoMap = buildContainerNoMap_(ss);
+
+    const periodPrefix = period.slice(0, 2) + "T" + period.slice(2, 4);
+    const filterRegex = new RegExp(`^${periodPrefix}(0[1-9]|[12][0-9]|30)$`);
+    const targetRows = sourceData.filter(row => row[SOURCE_COLS.E] && filterRegex.test(row[SOURCE_COLS.E].toString()));
+    
+    if (targetRows.length === 0) throw new Error("該当するデータが見つかりません。");
+    
+    const groupedByE = new Map();
+    for (const row of targetRows) {
+      const eValue = row[SOURCE_COLS.E];
+      if (!groupedByE.has(eValue)) groupedByE.set(eValue, []);
+      groupedByE.get(eValue).push(row);
+    }
+    const sortedEValues = [...groupedByE.keys()].sort();
+    
+    const targetSheet = ss.getSheetByName(CONFIG.targetSheetName);
+    const maxRows = targetSheet.getMaxRows();
+    if (maxRows >= CONFIG.startRow) {
+      const clearRange = targetSheet.getRange(CONFIG.startRow, 1, maxRows - CONFIG.startRow + 1, targetSheet.getMaxColumns());
+      clearRange.clear();
+      clearRange.clearNote();
+    }
+
+    let currentRow = CONFIG.startRow;
+    const firstShippingNo = currentShippingNo; 
+    let lastShippingNo = currentShippingNo;
+
+    for (const eValue of sortedEValues) {
+      const rowsForE = groupedByE.get(eValue);
+      const aggregatedData = aggregateDataByGCode(rowsForE, codeMap);
+      const blockStartRow = currentRow;
+
+      // インストンシートからコンテナNo.を取得
+      const containerNo = containerNoMap.get(eValue.toString()) || "";
+      const hasContainer = containerNo !== "";
+      
+      if (aggregatedData.size > 0) {
+        for (const [gCode, data] of aggregatedData.entries()) {
+          const isFirstRowOfBlock = (currentRow === blockStartRow);
+          const outputRow = new Array(targetSheet.getMaxColumns()).fill("");
+          
+          outputRow[TARGET_COLS.B_C_VAL - 1] = data.c_val;
+          outputRow[TARGET_COLS.C_F_VAL - 1] = data.f_val;
+          outputRow[TARGET_COLS.D_CODE - 1] = data.g_val;
+          outputRow[TARGET_COLS.F_QTY - 1] = data.totalQty;
+          outputRow[TARGET_COLS.I_QTY_COND - 1] = hasContainer ? data.totalQty : "";
+
+          if (isFirstRowOfBlock) {
+              outputRow[TARGET_COLS.A_SHIP_NO - 1] = currentShippingNo;
+              outputRow[TARGET_COLS.E_DATE - 1] = data.f_date;
+              outputRow[TARGET_COLS.G_DATE1 - 1] = data.o_date1;
+              outputRow[TARGET_COLS.H_DATE2 - 1] = data.p_date2;
+              outputRow[TARGET_COLS.K_PORT - 1] = data.k_port_text;
+              outputRow[TARGET_COLS.L_ETC - 1] = "40HQ";
+              outputRow[TARGET_COLS.M_E_VAL - 1] = eValue;
+          }
+          
+          const isProductRow = data.f_val && data.f_val.toString().includes("製品");
+          outputRow[TARGET_COLS.J_PERIOD - 1] = isProductRow ? data.j_period_text : data.h_val;
+
+          targetSheet.getRange(currentRow, 1, 1, outputRow.length).setValues([outputRow]);
+
+          if (isProductRow && data.j_period_comment) {
+            targetSheet.getRange(currentRow, TARGET_COLS.J_PERIOD).setNote(data.j_period_comment);
+          }
+          if (isFirstRowOfBlock && data.k_port_bg) {
+            targetSheet.getRange(currentRow, TARGET_COLS.K_PORT).setBackground(data.k_port_bg);
+          }
+          currentRow++;
+        }
+
+        // コンテナNo.があれば、REF No.の直下の行のM列に記載
+        if (hasContainer) {
+          targetSheet.getRange(blockStartRow + 1, TARGET_COLS.M_E_VAL).setValue(containerNo);
+        }
+
+        lastShippingNo = currentShippingNo;
+        currentShippingNo++;
+        currentRow += CONFIG.rowGap;
+      }
+    }
+
+    if (currentRow > CONFIG.startRow) {
+      const lastDataRow = currentRow - CONFIG.rowGap;
+      const numRows = lastDataRow - CONFIG.startRow + 1;
+
+      const pasteRange = targetSheet.getRange(CONFIG.startRow, 1, numRows, TARGET_COLS.M_E_VAL);
+      pasteRange.copyTo(pasteRange, SpreadsheetApp.CopyPasteType.PASTE_VALUES, false);
+
+      targetSheet.getRange(CONFIG.startRow, TARGET_COLS.E_DATE, numRows, 1).setNumberFormat("M月d日");
+      targetSheet.getRange(CONFIG.startRow, TARGET_COLS.G_DATE1, numRows, 2).setNumberFormat("M月d日");
+      targetSheet.getRange(CONFIG.startRow, TARGET_COLS.F_QTY, numRows, 1).setNumberFormat("#,##0");
+      targetSheet.getRange(CONFIG.startRow, TARGET_COLS.I_QTY_COND, numRows, 1).setNumberFormat("#,##0");
+
+      const borderRange = targetSheet.getRange(CONFIG.startRow, 1, numRows, TARGET_COLS.M_E_VAL);
+      borderRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+    }
+    
+    entrySheet.getRange("B6").setValue(period);
+    entrySheet.getRange("B7").setValue(`${firstShippingNo}~${lastShippingNo}`);
+    exportToExcel(); 
+
+  } catch (e) { ui.alert(`エラー: ${e.message}`); }
+}
+
+
+function aggregateDataByGCode(rows, codeMap) {
+  const aggregated = new Map();
+  for (const row of rows) {
+      const gCode = row[SOURCE_COLS.G_CODE];
+      if (!gCode) continue;
+      if (!aggregated.has(gCode)) {
+          const codeInfo = codeMap.get(gCode) || { c_val: "該当なし", f_val: "該当なし", g_val: "該当なし", h_val: "" };
+          let k_port_text = "";
+          let k_port_bg = null;
+          const port = row[SOURCE_COLS.Q_PORT];
+          if (port === "TOKYO") { k_port_text = "東京"; k_port_bg = "#ccffcc"; }
+          else if (port !== "OSAKA") { k_port_text = port; }
+          
+          aggregated.set(gCode, {
+              c_val: codeInfo.c_val, f_val: codeInfo.f_val, g_val: codeInfo.g_val, h_val: codeInfo.h_val,
+              f_date: row[5], o_date1: row[SOURCE_COLS.O_DATE1], p_date2: row[SOURCE_COLS.P_DATE2],
+              k_port_text: k_port_text, k_port_bg: k_port_bg, s_etc: row[SOURCE_COLS.S_ETC],
+              totalQty: 0, periods: new Map(),
+          });
+      }
+      const data = aggregated.get(gCode);
+      const qty = Number(row[SOURCE_COLS.I_QTY]) || 0;
+      const period = row[SOURCE_COLS.J_PERIOD];
+      data.totalQty += qty;
+      if (period) {
+          data.periods.set(period, (data.periods.get(period) || 0) + qty);
+      }
+  }
+  for (const data of aggregated.values()) {
+      const periodEntries = [...data.periods.entries()];
+      data.j_period_text = periodEntries.map(e => e[0].replace('月期', '')).join(',') + '月期';
+      data.j_period_comment = periodEntries.length > 1 ? periodEntries.map(e => `${e[0]} ${e[1]}`).join('\n') : null;
+  }
+  return aggregated;
+}
+
+// =====================================================================
+// == エクセル出力機能
+// =====================================================================
+
+function exportToExcel() {
+  const ui = SpreadsheetApp.getUi();
+  let tempGoogleSheetId = null;
+  let tempXlsxFileId = null;
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sourceSheet = ss.getSheetByName(CONFIG.targetSheetName);
+    const m7Value = sourceSheet.getRange("M7").getValue().toString();
+    const exportSheetName = m7Value.substring(0, 2) + m7Value.substring(3, 5);
+    const outputFileName = `タイガー様入荷予定(新建高)_${exportSheetName}.xlsx`;
+
+    const tempGoogleSheet = SpreadsheetApp.create(`[一時出力用]_${exportSheetName}`);
+    tempGoogleSheetId = tempGoogleSheet.getId();
+    const copiedSheet = sourceSheet.copyTo(tempGoogleSheet).setName(exportSheetName);
+
+    const dataRange = copiedSheet.getDataRange();
+    dataRange.copyTo(dataRange, SpreadsheetApp.CopyPasteType.PASTE_VALUES, false);
+
+    copiedSheet.getDataRange().setFontFamily("ＭＳ Ｐゴシック").setFontSize(11);
+    const defaultSheet = tempGoogleSheet.getSheetByName('シート1');
+    if (defaultSheet) tempGoogleSheet.deleteSheet(defaultSheet);
+    
+    SpreadsheetApp.flush();
+    const url = `https://docs.google.com/spreadsheets/d/${tempGoogleSheetId}/export?format=xlsx`;
+    const response = UrlFetchApp.fetch(url, { headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` } });
+    const blob = response.getBlob().setName(outputFileName);
+    const tempXlsxFile = DriveApp.createFile(blob);
+    tempXlsxFileId = tempXlsxFile.getId();
+    
+    const downloadUrl = `https://docs.google.com/uc?export?download&id=${tempXlsxFileId}`;
+    const html = HtmlService.createHtmlOutput(`<p>準備完了。 <a href="${downloadUrl}" target="_blank" onclick="google.script.host.close()">ダウンロード</a></p>`).setWidth(300).setHeight(100);
+    ui.showModalDialog(html, 'Excel出力');
+  } catch (e) { ui.alert(`エラー: ${e.message}`); }
+  finally {
+    if (tempGoogleSheetId) try { DriveApp.getFileById(tempGoogleSheetId).setTrashed(true); } catch(err) {}
+  }
+}
+
+// =====================================================================
+// == 自動化トリガー (onEdit, onSelectionChange)
+// =====================================================================
+
+function onEdit(e) {
+  const range = e.range;
+  const sheet = range.getSheet();
+  const sheetName = sheet.getName();
+  if (sheetName === CONFIG.containerSheetName && range.getA1Notation() === CONFIG.containerDropdownCell) {
+    handleContainerEdit(e);
+    return;
+  }
+}
+
+function onSelectionChange(e) {
+  try {
+    const sheet = e.range.getSheet();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const containerSheet = ss.getSheetByName(CONFIG.containerSheetName);
+    if (!containerSheet) return;
+    const dataStartRow = 5;
+    const lastCol = containerSheet.getLastColumn() || 10;
+    const lastDataRow = containerSheet.getLastRow();
+    if (lastDataRow < dataStartRow) return;
+    const dataRange = containerSheet.getRange(dataStartRow, 1, lastDataRow - dataStartRow + 1, lastCol);
+    if (sheet.getName() !== CONFIG.containerSheetName) {
+      dataRange.setBackground(null);
+      dataRange.setFontWeight("normal");
+      return;
+    }
+    dataRange.setBackground(null);
+    dataRange.setFontWeight("normal");
+    const selectedRow = e.range.getRow();
+    if (selectedRow >= dataStartRow && selectedRow <= lastDataRow) {
+      const highlightRange = containerSheet.getRange(selectedRow, 1, 1, lastCol);
+      highlightRange.setBackground("#ffff00");
+      highlightRange.setFontWeight("bold");
+    }
+  } catch (err) {}
+}
+
+
+// =====================================================================
+// == アフター部品更新（コード不足分追加 + 注残リスト更新 一体化）
+// =====================================================================
+
+/**
+ * アフター部品更新のエントリーポイント
+ * コード不足分追加 → 注残リスト更新 の順に実行する
+ */
+function updateAfterParts() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    // STEP 1: コード不足分追加
+    addMissingCodes();
+
+    // STEP 2: 注残リスト更新
+    updateZanzanList();
+  } catch (e) {
+    ui.alert(`エラー: ${e.message}`);
+  }
+}
+
+// =====================================================================
+// == 注残リスト自動記入機能
+// =====================================================================
+
+function updateZanzanList() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const zanSheet = ss.getSheetByName("注残リスト");
+    const sourceSheet = ss.getSheetByName(CONFIG.sourceSheetName);
+    const srcData = sourceSheet.getRange(2, 1, sourceSheet.getLastRow() - 1, sourceSheet.getLastColumn()).getValues();
+    const srcByCode = new Map();
+    for (const row of srcData) {
+      const gCode = (row[SOURCE_COLS.G_CODE] || "").toString();
+      const refNo = (row[SOURCE_COLS.E] || "").toString();
+      if (!gCode || !refNo) continue;
+      if (!srcByCode.has(gCode)) srcByCode.set(gCode, []);
+      srcByCode.get(gCode).push({
+        ref: refNo,
+        shipDate: row[5] instanceof Date ? row[5] : new Date(row[5]),
+        eta: row[SOURCE_COLS.P_DATE2] instanceof Date ? row[SOURCE_COLS.P_DATE2] : (row[SOURCE_COLS.P_DATE2] ? new Date(row[SOURCE_COLS.P_DATE2]) : null)
+      });
+    }
+    const zanData = zanSheet.getRange(2, 1, zanSheet.getLastRow() - 1, 15).getValues();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    let updatedCount = 0;
+    let completedByDateCount = 0;
+    for (let i = 0; i < zanData.length; i++) {
+      const zanRow = zanData[i];
+      const code = (zanRow[0] || "").toString();
+      if (zanRow[12] || !code || !srcByCode.has(code)) continue;
+      const orderDate = zanRow[5] instanceof Date ? zanRow[5] : new Date(zanRow[5]);
+      const validEntries = srcByCode.get(code).filter(e => e.shipDate && e.shipDate.getTime() >= orderDate.getTime());
+      if (validEntries.length === 0) continue;
+      validEntries.sort((a, b) => (a.eta?.getTime() || Infinity) - (b.eta?.getTime() || Infinity));
+      const earliestEta = validEntries[0].eta || "";
+      const refString = [...new Set(validEntries.map(e => e.ref))].join(",");
+
+      // 納入予定（M列）が今日以前なら注残0・済にする
+      let status = "";
+      if (earliestEta instanceof Date && earliestEta.getTime() <= today.getTime()) {
+        zanSheet.getRange(i + 2, 10).setValue(0);
+        status = "済";
+        completedByDateCount++;
+      } else if (zanRow[9] === 0) {
+        status = "済";
+      }
+
+      zanSheet.getRange(i + 2, 13, 1, 3).setValues([[earliestEta, refString, status]]);
+      if (earliestEta instanceof Date) zanSheet.getRange(i + 2, 13).setNumberFormat("yyyy/M/d");
+      updatedCount++;
+    }
+    const msg = updatedCount > 0
+      ? `注残リストを更新しました(${updatedCount}件)\nうち納入予定日到来による完了: ${completedByDateCount}件`
+      : "更新対象なし";
+    ui.alert(msg);
+  } catch (e) { ui.alert(`エラー: ${e.message}`); }
+}
+
+// =====================================================================
+// == コード不足分追加機能（補完・重複削除・新規追加）
+// =====================================================================
+
+function addMissingCodes() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const zanSheet = ss.getSheetByName("注残リスト");
+    const codeSheet = ss.getSheetByName(CONFIG.codeSheetName);
+    if (!zanSheet || !codeSheet) throw new Error("「注残リスト」または「コード」シートが見つかりません。");
+    const zanLastRow = zanSheet.getLastRow();
+    if (zanLastRow < 2) { ui.alert("注残リストにデータがありません。"); return; }
+    const zanData = zanSheet.getRange(2, 1, zanLastRow - 1, 5).getValues();
+    const zanByKitaka = new Map(); const zanByHinmoku = new Map();
+    for (const row of zanData) {
+      const shinken = (row[0]||"").toString(), kitaka = (row[1]||"").toString(), hinmoku = (row[3]||"").toString(), hinmei = (row[4]||"").toString();
+      const info = { shinkenCode: shinken, kitakaCode: kitaka, hinmoku, hinmei };
+      if (kitaka && !zanByKitaka.has(kitaka)) zanByKitaka.set(kitaka, info);
+      if (hinmoku && !zanByHinmoku.has(hinmoku)) zanByHinmoku.set(hinmoku, info);
+    }
+    const results = [];
+    results.push(`【補完】${fillIncompleteRows(ui, codeSheet, zanByKitaka, zanByHinmoku)} 件`);
+    results.push(`【重複削除】${removeDuplicateRows(ui, codeSheet)} 件`);
+    results.push(`【新規追加】${addNewMissingRows(ui, codeSheet, zanData)} 件`);
+    ui.alert('処理完了', results.join('\n'), ui.ButtonSet.OK);
+  } catch (e) { ui.alert(`エラー: ${e.message}`); }
+}
+
+function fillIncompleteRows(ui, codeSheet, zanByKitaka, zanByHinmoku) {
+  const codeLastRow = codeSheet.getLastRow(); if (codeLastRow < 3) return 0;
+  const dataRange = codeSheet.getRange(3, 1, codeLastRow - 2, 8); const data = dataRange.getValues(); const candidates = [];
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i], bVal=(row[1]||"").toString(), cVal=(row[2]||"").toString(), dVal=(row[3]||"").toString(), eVal=(row[4]||"").toString(), rowNum=i+3;
+    const isEmpty = (v) => !v || v === "確認中";
+    let zanInfo = null;
+    if (eVal && eVal !== "確認中") zanInfo = zanByKitaka.get(eVal) || null;
+    if (!zanInfo && dVal && dVal !== "確認中") zanInfo = zanByHinmoku.get(dVal) || null;
+    if (!zanInfo) continue;
+    const fills = [];
+    if (isEmpty(bVal) && zanInfo.shinkenCode) fills.push({colIdx:1, new_:zanInfo.shinkenCode, label:"新建高コード(B)"});
+    if (isEmpty(cVal) && zanInfo.hinmei) fills.push({colIdx:2, new_:zanInfo.hinmei, label:"部品名(C)"});
+    if (isEmpty(dVal) && zanInfo.hinmoku) fills.push({colIdx:3, new_:zanInfo.hinmoku, label:"品目(D)"});
+    if (isEmpty(eVal) && zanInfo.kitakaCode) fills.push({colIdx:4, new_:zanInfo.kitakaCode, label:"気高コード(E)"});
+    if (fills.length > 0) candidates.push({rowIndex:i, fills, rowNum});
+  }
+  if (candidates.length === 0) return 0;
+  const summary = candidates.slice(0,15).map(c => `行${c.rowNum}: ${c.fills.map(f=>f.label).join(", ")}`).join('\n');
+  const more = candidates.length > 15 ? `\n...他 ${candidates.length-15} 件` : "";
+  if (ui.alert('STEP 1: 空欄・確認中の補完', `${candidates.length} 件の補完対象\n\n${summary}${more}\n\n補完しますか？`, ui.ButtonSet.YES_NO) !== ui.Button.YES) return 0;
+  for (const c of candidates) for (const f of c.fills) data[c.rowIndex][f.colIdx] = f.new_;
+  dataRange.setValues(data); return candidates.length;
+}
+
+function removeDuplicateRows(ui, codeSheet) {
+  const codeLastRow = codeSheet.getLastRow(); if (codeLastRow < 3) return 0;
+  const numDataRows = codeLastRow-2, numCols = codeSheet.getLastColumn();
+  const data = codeSheet.getRange(3,1,numDataRows,numCols).getValues();
+  const seen = new Map(), dupIdx = new Set(), dupInfo = [];
+  for (let i=0; i<data.length; i++) { const e=(data[i][4]||"").toString(); if(!e) continue; if(seen.has(e)){dupIdx.add(i);dupInfo.push({rowNum:i+3,kitaka:e,firstRow:seen.get(e)});}else seen.set(e,i+3); }
+  if (dupInfo.length === 0) return 0;
+  const summary = dupInfo.slice(0,15).map(d=>`行${d.rowNum} (気高:${d.kitaka}) ← 行${d.firstRow}と重複`).join('\n');
+  const more = dupInfo.length > 15 ? `\n...他 ${dupInfo.length-15} 件` : "";
+  if (ui.alert('STEP 2: 重複行の削除', `${dupInfo.length} 件の重複行\n\n${summary}${more}\n\n削除しますか？`, ui.ButtonSet.YES_NO) !== ui.Button.YES) return 0;
+  const keep = data.filter((_,idx) => !dupIdx.has(idx));
+  codeSheet.getRange(3,1,numDataRows,numCols).clearContent();
+  if (keep.length > 0) codeSheet.getRange(3,1,keep.length,numCols).setValues(keep);
+  return dupInfo.length;
+}
+
+function addNewMissingRows(ui, codeSheet, zanData) {
+  const codeLastRow = codeSheet.getLastRow();
+  const codeData = codeLastRow >= 3 ? codeSheet.getRange(3,1,codeLastRow-2,8).getValues() : [];
+  const existK = new Set(), existH = new Set();
+  for (const r of codeData) { if(r[4]) existK.add(r[4].toString()); if(r[3]) existH.add(r[3].toString()); }
+  const missing = new Map();
+  for (const r of zanData) {
+    const sk=(r[0]||"").toString(), kk=(r[1]||"").toString(), hm=(r[3]||"").toString(), hn=(r[4]||"").toString();
+    if(!kk && !hm) continue; if(existK.has(kk)) continue; if(hm && existH.has(hm)) continue;
+    const key = kk||hm; if(!missing.has(key)) missing.set(key, {shinkenCode:sk, kitakaCode:kk, hinmoku:hm, hinmei:hn});
+  }
+  if (missing.size === 0) return 0;
+  if (ui.alert('STEP 3: 新規追加', `${missing.size} 件の未登録アイテム\n追加しますか？`, ui.ButtonSet.YES_NO) !== ui.Button.YES) return 0;
+  const rows = [];
+  for (const it of missing.values()) rows.push(["", it.shinkenCode, it.hinmei, it.hinmoku, it.kitakaCode, "", "", "松田様依頼分"]);
+  codeSheet.getRange(codeSheet.getLastRow()+1, 1, rows.length, 8).setValues(rows);
+  return rows.length;
+}
+
+
+// =====================================================================
+// == インストンシート参照ユーティリティ
+// =====================================================================
+
+/**
+ * インストンシートからREF No.→コンテナNo.のMapを構築する
+ * インストンシート: E列=REF No., L列=コンテナNo.
+ * @param {Spreadsheet} ss - スプレッドシート
+ * @return {Map<string, string>} REF No.をキー、コンテナNo.を値とするMap
+ */
+function buildContainerNoMap_(ss) {
+  const containerNoMap = new Map();
+  const instonSheet = ss.getSheetByName("インストン");
+  if (!instonSheet) return containerNoMap;
+  const lastRow = instonSheet.getLastRow();
+  if (lastRow < 2) return containerNoMap;
+  // E列(5)=REF No., L列(12)=コンテナNo. を一括取得
+  const data = instonSheet.getRange(2, 1, lastRow - 1, 12).getValues();
+  for (const row of data) {
+    const refNo = (row[4] || "").toString().trim();   // E列(0始まり=4)
+    const containerNo = (row[11] || "").toString().trim(); // L列(0始まり=11)
+    if (refNo && containerNo) {
+      containerNoMap.set(refNo, containerNo);
+    }
+  }
+  return containerNoMap;
+}

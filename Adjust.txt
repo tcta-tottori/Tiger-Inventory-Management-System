@@ -1,0 +1,460 @@
+// =====================================================================
+// == 数量自動調整機能 + バックアップ機能 (adjust.gs)
+// == ※ CONFIG, SOURCE_COLS は main.gs で定義済みのものを参照
+// =====================================================================
+
+/**
+ * スピル配列数式の出力先列（0始まりインデックス）
+ * A2,B2,C2,H2 に ArrayFormula があるため、3行目以降に値を書き込むとエラーになる
+ */
+const SPILL_COL_INDEXES = [0, 1, 2, 7]; // A=0, B=1, C=2, H=7
+
+/**
+ * 数量自動調整のエントリーポイント
+ */
+function adjustQuantities() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const response = ui.prompt(
+      '数量自動調整',
+      '調整を開始する月期を入力してください（例: 3 or 3月期）\nこの月期以降の差異を調整します。',
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (response.getSelectedButton() !== ui.Button.OK) return;
+    const input = response.getResponseText().trim();
+    if (!input) { ui.alert('月期を入力してください。'); return; }
+
+    const startPeriod = normalizePeriod_(input);
+    if (!startPeriod) {
+      ui.alert('入力を認識できません。\n数字（例: 3）または「○月期」の形式で入力してください。');
+      return;
+    }
+
+    PropertiesService.getScriptProperties().setProperty('adjustStartPeriod', startPeriod);
+    setProgress_(0, '準備中...', '');
+
+    const html = HtmlService.createHtmlOutput(getProgressHtml_())
+      .setTitle('数量自動調整')
+      .setWidth(300);
+    ui.showSidebar(html);
+
+  } catch (e) {
+    ui.alert(`エラー: ${e.message}`);
+  }
+}
+
+
+/**
+ * サイドバーから呼ばれる実際の調整処理
+ */
+function runAdjustProcess() {
+  try {
+    const startPeriod = PropertiesService.getScriptProperties().getProperty('adjustStartPeriod');
+    if (!startPeriod) throw new Error('開始月期が設定されていません。');
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    setProgress_(5, 'バックアップ作成中...', '');
+
+    // --- バックアップ作成（シート丸ごとコピー） ---
+    const sourceSheet = ss.getSheetByName(CONFIG.sourceSheetName);
+    if (!sourceSheet) throw new Error('出荷予定明細シートが見つかりません。');
+    const backupName = CONFIG.sourceSheetName + '_BK_' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd_HHmm');
+    createSheetBackup_(ss, sourceSheet, backupName);
+    setProgress_(10, 'バックアップ完了', backupName);
+
+    // --- シート取得 ---
+    const tokyoSheet = ss.getSheetByName(CONFIG.tokyoSheetName);
+    const osakaSheet = ss.getSheetByName(CONFIG.osakaSheetName);
+    if (!tokyoSheet || !osakaSheet) throw new Error('東京向けまたは大阪向けシートが見つかりません。');
+
+    // --- 東京向けの月期リスト ---
+    const tokyoPeriodList = getPeriodList_(tokyoSheet);
+    const tokyoStartIdx = tokyoPeriodList.indexOf(startPeriod);
+    if (tokyoStartIdx === -1) throw new Error(`「${startPeriod}」が東京向けヘッダーに見つかりません。\n存在する月期: ${tokyoPeriodList.join(', ')}`);
+    const tokyoTargetPeriods = tokyoPeriodList.slice(tokyoStartIdx);
+
+    // --- 東京向け調整 ---
+    setProgress_(15, '東京向け 調整開始...', `対象月期: ${tokyoTargetPeriods.join(', ')}`);
+    const tokyoCount = adjustForDirectionWithProgress_(ss, tokyoSheet, ss.getSheetByName(CONFIG.sourceSheetName), tokyoTargetPeriods, 'TOKYO', 15, 55);
+    SpreadsheetApp.flush();
+
+    // --- 大阪向けの月期リスト（東京向けと異なる可能性あり） ---
+    const osakaPeriodList = getPeriodList_(osakaSheet);
+    const osakaStartIdx = osakaPeriodList.indexOf(startPeriod);
+    const osakaTargetPeriods = osakaStartIdx !== -1 ? osakaPeriodList.slice(osakaStartIdx) : osakaPeriodList;
+
+    // --- 大阪向け調整 ---
+    setProgress_(55, '大阪向け 調整開始...', `対象月期: ${osakaTargetPeriods.join(', ')}`);
+    const osakaCount = adjustForDirectionWithProgress_(ss, osakaSheet, ss.getSheetByName(CONFIG.sourceSheetName), osakaTargetPeriods, 'OSAKA', 55, 95);
+    SpreadsheetApp.flush();
+
+    const resultMsg = `東京向け対象月期: ${tokyoTargetPeriods.join(', ')}\n東京向け: ${tokyoCount} 件\n大阪向け対象月期: ${osakaTargetPeriods.join(', ')}\n大阪向け: ${osakaCount} 件\nバックアップ: ${backupName}`;
+    setProgress_(100, '完了', resultMsg);
+    PropertiesService.getScriptProperties().deleteProperty('adjustStartPeriod');
+    return resultMsg;
+
+  } catch (e) {
+    setProgress_(-1, 'エラー', e.message);
+    return 'エラー: ' + e.message;
+  }
+}
+
+
+/**
+ * シート丸ごとコピーによるバックアップ作成
+ * copyTo()でシートの状態（書式・数式・メモ等）をそのまま複製する
+ * @param {Spreadsheet} ss - スプレッドシート
+ * @param {Sheet} sourceSheet - バックアップ元シート
+ * @param {string} backupName - バックアップシート名
+ */
+function createSheetBackup_(ss, sourceSheet, backupName) {
+  // 同名のバックアップが既にある場合は削除
+  const existing = ss.getSheetByName(backupName);
+  if (existing) ss.deleteSheet(existing);
+
+  // シートを丸ごとコピー＆リネーム
+  const backup = sourceSheet.copyTo(ss);
+  backup.setName(backupName);
+}
+
+
+// =====================================================================
+// == ユーティリティ関数
+// =====================================================================
+
+function getProgress() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    percent: parseInt(props.getProperty('adjustProgress') || '0', 10),
+    status: props.getProperty('adjustStatus') || '',
+    detail: props.getProperty('adjustDetail') || '',
+  };
+}
+
+function setProgress_(percent, status, detail) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('adjustProgress', String(percent));
+  props.setProperty('adjustStatus', status);
+  props.setProperty('adjustDetail', detail || '');
+}
+
+function normalizePeriod_(input) {
+  const matchFull = input.match(/^(\d{1,2})月期$/);
+  if (matchFull) return parseInt(matchFull[1], 10) + "月期";
+  const matchMonth = input.match(/^(\d{1,2})月$/);
+  if (matchMonth) return parseInt(matchMonth[1], 10) + "月期";
+  const matchNum = input.match(/^(\d{1,2})$/);
+  if (matchNum) { const num = parseInt(matchNum[1], 10); if (num >= 1 && num <= 12) return num + "月期"; }
+  return null;
+}
+
+function getNextPeriod_(period) {
+  const match = period.match(/(\d+)月期/);
+  if (!match) return period;
+  const month = parseInt(match[1], 10);
+  return (month === 12 ? 1 : month + 1) + "月期";
+}
+
+function getPeriodList_(dirSheet) {
+  const headers = dirSheet.getRange(1, 1, 1, dirSheet.getLastColumn()).getValues()[0];
+  const periods = [];
+  for (const h of headers) {
+    if (h && h.toString().match(/^\d+月期$/)) periods.push(h.toString());
+  }
+  return periods;
+}
+
+
+// =====================================================================
+// == 調整処理本体
+// =====================================================================
+
+/**
+ * 方向別（東京/大阪）の調整処理（プログレスバー付き）
+ * 月期→アイテムの順にループし、出荷予定明細のデータをメモリ上で一括操作
+ * @param {Spreadsheet} ss - スプレッドシート
+ * @param {Sheet} dirSheet - 東京向けまたは大阪向けシート
+ * @param {Sheet} sourceSheet - 出荷予定明細シート
+ * @param {string[]} targetPeriods - 処理対象の月期リスト（開始月期～末尾）
+ * @param {string} port - 仕向地（'TOKYO' or 'OSAKA'）
+ * @param {number} progressStart - プログレスバー開始%
+ * @param {number} progressEnd - プログレスバー終了%
+ * @return {number} 調整件数
+ */
+function adjustForDirectionWithProgress_(ss, dirSheet, sourceSheet, targetPeriods, port, progressStart, progressEnd) {
+  const dirData = dirSheet.getRange(1, 1, dirSheet.getLastRow(), dirSheet.getLastColumn()).getValues();
+  const headers = dirData[0];
+  let adjustCount = 0;
+
+  // --- 方向シートの列マッピング構築 ---
+  const periodCols = {};
+  for (let c = 0; c < headers.length; c++) {
+    const h = (headers[c] || "").toString();
+    if (h.match(/^\d+月期$/)) {
+      periodCols[h] = { orderCol: c - 1, qtyCol: c, diffCol: c + 1 };
+    }
+  }
+
+  // --- 方向シートのアイテム一覧（D列=新建高コード） ---
+  const itemRows = [];
+  for (let row = 1; row < dirData.length; row++) {
+    const code = (dirData[row][3] || "").toString();
+    if (code) itemRows.push({ row: row, code: code });
+  }
+
+  const totalItems = itemRows.length * targetPeriods.length;
+  let processedItems = 0;
+  const portLabel = port === 'TOKYO' ? '東京向け' : '大阪向け';
+
+  // --- 出荷予定明細の全データをメモリに読み込み ---
+  const srcLastRow = sourceSheet.getLastRow();
+  const srcLastCol = sourceSheet.getLastColumn();
+  if (srcLastRow < 2) return 0;
+  const srcData = sourceSheet.getRange(2, 1, srcLastRow - 1, srcLastCol).getValues();
+
+  // --- 月期→アイテム順でループ ---
+  for (const period of targetPeriods) {
+    const cols = periodCols[period];
+    if (!cols) continue;
+
+    // 月期の切り替え時にflushして前の月期の出荷予定明細変更を方向シートに反映
+    SpreadsheetApp.flush();
+
+    for (const item of itemRows) {
+      processedItems++;
+
+      if (processedItems % 5 === 0 || processedItems === totalItems) {
+        const pct = progressStart + Math.round((progressEnd - progressStart) * processedItems / totalItems);
+        setProgress_(pct, `${portLabel} 処理中...`, `${item.code} / ${period} (${processedItems}/${totalItems})`);
+      }
+
+      // 方向シートから最新の差異を取得（flushで反映済み）
+      SpreadsheetApp.flush();
+      const currentDiff = dirSheet.getRange(item.row + 1, cols.diffCol + 1).getValue();
+      if (currentDiff === 0 || currentDiff === "" || currentDiff === null) continue;
+
+      const needed = Number(currentDiff) * -1; // 差異<0(不足)→needed>0, 差異>0(過剰)→needed<0
+      if (needed === 0) continue;
+
+      // 出荷予定明細から該当コード・仕向地の行を抽出
+      const candidateRows = [];
+      for (let i = 0; i < srcData.length; i++) {
+        const rowCode = (srcData[i][6] || "").toString(); // G列=コード
+        const rowPort = (srcData[i][16] || "").toString(); // Q列=仕向地
+        const rowQty = Number(srcData[i][8]) || 0; // I列=数量
+        const rowPeriod = (srcData[i][9] || "").toString(); // J列=月期
+        if (rowCode !== item.code || rowPort !== port || rowQty <= 0) continue;
+        if (!rowPeriod.match(/^\d+月期$/)) continue; // 月期形式でない行はスキップ
+        candidateRows.push({ index: i, qty: rowQty, period: rowPeriod, ref: (srcData[i][4] || "").toString() });
+      }
+      if (candidateRows.length === 0) continue;
+
+      // --- 調整実行 ---
+      const adjusted = adjustSourceData_(sourceSheet, srcData, candidateRows, period, needed, targetPeriods);
+      if (adjusted) adjustCount++;
+    }
+  }
+  return adjustCount;
+}
+
+
+/**
+ * 出荷予定明細のデータを調整する（月期振替・行分割）
+ *
+ * 調整方針:
+ *  - 不足（needed>0）: 後の月期の行から対象月期へ数量を振替
+ *  - 過剰（needed<0）: 対象月期の行から次の月期へ数量を振替
+ *  - 振替元は近い月期から優先、同月期内はREF昇順
+ *  - 全行が対象（確定分・コンテナ登録の区別なし）
+ *  - 調整しきれない場合はスルー
+ *
+ * @param {Sheet} sourceSheet - 出荷予定明細シート
+ * @param {Array[]} srcData - メモリ上の出荷予定明細データ（2行目～、0始まり）
+ * @param {Object[]} candidateRows - 候補行 [{index, qty, period, ref}, ...]
+ * @param {string} targetPeriod - 調整対象の月期
+ * @param {number} needed - 必要数量（正=不足、負=過剰）
+ * @param {string[]} allTargetPeriods - 処理対象の月期リスト
+ * @return {boolean} 調整が行われたかどうか
+ */
+function adjustSourceData_(sourceSheet, srcData, candidateRows, targetPeriod, needed, allTargetPeriods) {
+  const targetPeriodIdx = allTargetPeriods.indexOf(targetPeriod);
+
+  let remaining = needed;
+  const newRows = [];
+  const modifiedCells = [];
+
+  if (remaining > 0) {
+    // --- 不足: 後の月期の行から対象月期へ振替 ---
+    const donorRows = candidateRows.filter(r => {
+      const rIdx = allTargetPeriods.indexOf(r.period);
+      return rIdx > targetPeriodIdx; // 対象月期より後の月期のみ
+    });
+
+    // 近い月期から優先（月期リスト順→同月期内はREF昇順）
+    donorRows.sort((a, b) => {
+      const aIdx = allTargetPeriods.indexOf(a.period);
+      const bIdx = allTargetPeriods.indexOf(b.period);
+      if (aIdx !== bIdx) return aIdx - bIdx;
+      return a.ref.localeCompare(b.ref);
+    });
+
+    for (const donor of donorRows) {
+      if (remaining <= 0) break;
+      // srcDataの最新値を使用（前の調整でqtyが変わっている可能性）
+      const currentQty = Number(srcData[donor.index][8]) || 0;
+      if (currentQty <= 0) continue;
+      const transferQty = Math.min(currentQty, remaining);
+
+      if (transferQty === currentQty) {
+        // 全量振替: 月期を変更するだけ
+        srcData[donor.index][9] = targetPeriod;
+        modifiedCells.push({ rowNum: donor.index + 2, col: 10, value: targetPeriod, comment: `自動調整: ${donor.period}→${targetPeriod} へ変更` });
+      } else {
+        // 部分振替: 元行の数量を減らし、新しい行を作成
+        srcData[donor.index][8] = currentQty - transferQty;
+        modifiedCells.push({ rowNum: donor.index + 2, col: 9, value: currentQty - transferQty, comment: `自動調整: ${currentQty}→${currentQty - transferQty} (${transferQty}を${targetPeriod}へ振替)` });
+        const newRow = srcData[donor.index].slice();
+        newRow[8] = transferQty;
+        newRow[9] = targetPeriod;
+        for (const colIdx of SPILL_COL_INDEXES) { newRow[colIdx] = ""; }
+        newRows.push({ afterIndex: donor.index, rowData: newRow, comment: `自動調整: ${donor.ref}から${transferQty}を${donor.period}→${targetPeriod}へ振替(新規行)` });
+      }
+      remaining -= transferQty;
+    }
+
+  } else if (remaining < 0) {
+    // --- 過剰: 対象月期の行から次の月期へ振替 ---
+    const nextPeriodIdx = targetPeriodIdx + 1;
+    if (nextPeriodIdx >= allTargetPeriods.length) return false;
+    const nextPeriod = allTargetPeriods[nextPeriodIdx];
+    let toRemove = Math.abs(remaining);
+
+    // 対象月期の行を、REF降順（後ろのREFから先に振替）
+    const excessRows = candidateRows.filter(r => r.period === targetPeriod);
+    excessRows.sort((a, b) => b.ref.localeCompare(a.ref));
+
+    for (const excess of excessRows) {
+      if (toRemove <= 0) break;
+      const currentQty = Number(srcData[excess.index][8]) || 0;
+      if (currentQty <= 0) continue;
+      const transferQty = Math.min(currentQty, toRemove);
+
+      if (transferQty === currentQty) {
+        // 全量振替: 月期を変更するだけ
+        srcData[excess.index][9] = nextPeriod;
+        modifiedCells.push({ rowNum: excess.index + 2, col: 10, value: nextPeriod, comment: `自動調整: ${targetPeriod}→${nextPeriod} へ変更` });
+      } else {
+        // 部分振替
+        srcData[excess.index][8] = currentQty - transferQty;
+        modifiedCells.push({ rowNum: excess.index + 2, col: 9, value: currentQty - transferQty, comment: `自動調整: ${currentQty}→${currentQty - transferQty} (${transferQty}を${nextPeriod}へ振替)` });
+        const newRow = srcData[excess.index].slice();
+        newRow[8] = transferQty;
+        newRow[9] = nextPeriod;
+        for (const colIdx of SPILL_COL_INDEXES) { newRow[colIdx] = ""; }
+        newRows.push({ afterIndex: excess.index, rowData: newRow, comment: `自動調整: ${excess.ref}から${transferQty}を${targetPeriod}→${nextPeriod}へ振替(新規行)` });
+      }
+      toRemove -= transferQty;
+    }
+  }
+
+  if (modifiedCells.length === 0 && newRows.length === 0) return false;
+
+  // --- シートへの書き込み ---
+  for (const mc of modifiedCells) {
+    sourceSheet.getRange(mc.rowNum, mc.col).setValue(mc.value);
+    sourceSheet.getRange(mc.rowNum, mc.col).setNote(mc.comment);
+  }
+
+  // 新規行挿入（後ろから処理して行番号ズレを防止）
+  newRows.sort((a, b) => b.afterIndex - a.afterIndex);
+  for (const nr of newRows) {
+    const insertAfterRow = nr.afterIndex + 2;
+    sourceSheet.insertRowAfter(insertAfterRow);
+    const newRowNum = insertAfterRow + 1;
+    sourceSheet.getRange(newRowNum, 1, 1, nr.rowData.length).setValues([nr.rowData]);
+    for (const colIdx of SPILL_COL_INDEXES) {
+      sourceSheet.getRange(newRowNum, colIdx + 1).clearContent();
+    }
+    sourceSheet.getRange(newRowNum, 9).setNote(nr.comment);
+    sourceSheet.getRange(newRowNum, 10).setNote(nr.comment);
+
+    // srcDataにも挿入行を反映（以降のインデックスで整合性を保つ）
+    srcData.splice(nr.afterIndex + 1, 0, nr.rowData);
+  }
+
+  return true;
+}
+
+
+// =====================================================================
+// == プログレスバーHTML
+// =====================================================================
+
+function getProgressHtml_() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: 'Google Sans', Arial, sans-serif; padding: 16px; margin: 0; background: #fafafa; }
+  h3 { margin: 0 0 16px 0; color: #1a73e8; font-size: 15px; }
+  .progress-container { background: #e0e0e0; border-radius: 8px; overflow: hidden; height: 24px; margin-bottom: 12px; }
+  .progress-bar { height: 100%; border-radius: 8px; transition: width 0.4s ease; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: bold; min-width: 40px; }
+  .progress-bar.running { background: linear-gradient(90deg, #1a73e8, #4285f4); }
+  .progress-bar.done { background: linear-gradient(90deg, #0d652d, #34a853); }
+  .progress-bar.error { background: linear-gradient(90deg, #c5221f, #ea4335); }
+  .status { font-size: 13px; color: #333; margin-bottom: 6px; font-weight: bold; }
+  .detail { font-size: 11px; color: #666; margin-bottom: 16px; word-break: break-all; min-height: 32px; }
+  .log { font-size: 11px; color: #555; border-top: 1px solid #ddd; padding-top: 10px; margin-top: 10px; max-height: 200px; overflow-y: auto; }
+  .log-entry { padding: 2px 0; border-bottom: 1px solid #f0f0f0; }
+  .btn-close { display: none; margin-top: 12px; padding: 8px 24px; background: #1a73e8; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  .btn-close:hover { background: #1557b0; }
+</style>
+</head>
+<body>
+  <h3>数量自動調整</h3>
+  <div class="progress-container">
+    <div class="progress-bar running" id="bar" style="width: 0%;">0%</div>
+  </div>
+  <div class="status" id="status">開始しています...</div>
+  <div class="detail" id="detail"></div>
+  <div class="log" id="log"></div>
+  <button class="btn-close" id="btnClose" onclick="google.script.host.close()">閉じる</button>
+<script>
+  let lastStatus = '';
+  let started = false;
+  function startProcess() {
+    if (started) return;
+    started = true;
+    google.script.run.withSuccessHandler(function(){}).withFailureHandler(onError).runAdjustProcess();
+    pollProgress();
+  }
+  function pollProgress() {
+    google.script.run.withSuccessHandler(function(data) {
+      updateUI(data);
+      if (data.percent < 100 && data.percent >= 0) setTimeout(pollProgress, 800);
+    }).withFailureHandler(function() { setTimeout(pollProgress, 1500); }).getProgress();
+  }
+  function updateUI(data) {
+    const bar = document.getElementById('bar');
+    const pct = Math.max(0, Math.min(100, data.percent));
+    bar.style.width = pct + '%'; bar.textContent = pct + '%';
+    if (data.percent >= 100) bar.className = 'progress-bar done';
+    else if (data.percent < 0) { bar.className = 'progress-bar error'; bar.style.width = '100%'; bar.textContent = 'エラー'; }
+    else bar.className = 'progress-bar running';
+    document.getElementById('status').textContent = data.status || '';
+    document.getElementById('detail').textContent = data.detail || '';
+    if (data.status && data.status !== lastStatus) { lastStatus = data.status; addLog(data.status); }
+    if (data.percent >= 100 || data.percent < 0) document.getElementById('btnClose').style.display = 'inline-block';
+  }
+  function addLog(msg) {
+    const log = document.getElementById('log');
+    const entry = document.createElement('div'); entry.className = 'log-entry';
+    entry.textContent = new Date().toLocaleTimeString('ja-JP') + ' ' + msg;
+    log.appendChild(entry); log.scrollTop = log.scrollHeight;
+  }
+  function onError(err) { updateUI({ percent: -1, status: 'エラー', detail: err.message || String(err) }); }
+  window.onload = function() { setTimeout(startProcess, 500); };
+</script>
+</body>
+</html>`;
+}
